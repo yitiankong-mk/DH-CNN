@@ -1,1 +1,95 @@
-models/.gitkeep
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class DualHeadCNN(nn.Module):
+    def __init__(
+        self,
+        input_length,
+        num_classes,
+        embed_dim=64,
+        mlp_drop1=0.25,
+        mlp_drop2=0.25,
+        mlp_drop3=0.10,
+    ):
+        super().__init__()
+
+        self.medium_conv = nn.Sequential(
+            nn.Conv1d(1, 32, 71, padding=35), nn.BatchNorm1d(32), nn.ReLU(),
+            nn.MaxPool1d(2),
+            nn.Conv1d(32, 64, 61, padding=30), nn.BatchNorm1d(64), nn.ReLU(),
+            nn.MaxPool1d(2),
+            nn.Conv1d(64, embed_dim, 25, padding=12), nn.BatchNorm1d(embed_dim), nn.ReLU()
+        )
+
+        self.local_conv = nn.Sequential(
+            nn.Conv1d(1, 32, 25, padding=12), nn.BatchNorm1d(32), nn.ReLU(),
+            nn.MaxPool1d(2),
+            nn.Conv1d(32, 64, 17, padding=8), nn.BatchNorm1d(64), nn.ReLU(),
+            nn.MaxPool1d(2),
+            nn.Conv1d(64, embed_dim, 11, padding=5), nn.BatchNorm1d(embed_dim), nn.ReLU()
+        )
+
+        self.q_proj = nn.Conv1d(embed_dim, embed_dim, 1)
+        self.k_proj = nn.Conv1d(embed_dim, embed_dim, 1)
+        self.v_proj = nn.Conv1d(embed_dim, embed_dim, 1)
+        self.scale = math.sqrt(embed_dim)
+
+        self.fuse_conv = nn.Sequential(
+            nn.Conv1d(embed_dim * 2, embed_dim, 1),
+            nn.BatchNorm1d(embed_dim),
+            nn.ReLU()
+        )
+        self.refine_conv = nn.Sequential(
+            nn.Conv1d(embed_dim, embed_dim, kernel_size=3, padding=1),
+            nn.BatchNorm1d(embed_dim),
+            nn.GELU(),
+        )
+
+        self.dropout = nn.Dropout(0.1)
+
+        flat_dim = embed_dim * (input_length // 4)
+        self.fc = nn.Sequential(
+            nn.Linear(flat_dim, 1024),
+            nn.GELU(),
+            nn.Dropout(mlp_drop1),
+
+            nn.Linear(1024, 512),
+            nn.GELU(),
+            nn.Dropout(mlp_drop2),
+
+            nn.Linear(512, 256),
+            nn.GELU(),
+            nn.Dropout(mlp_drop3),
+
+            nn.Linear(256, num_classes),
+        )
+
+    def forward(self, x):
+        B = x.size(0)
+
+        xm = self.medium_conv(x)
+        xl = self.local_conv(x)
+
+        L = min(xm.shape[-1], xl.shape[-1])
+        xm = F.adaptive_avg_pool1d(xm, L)
+        xl = F.adaptive_avg_pool1d(xl, L)
+        Q = self.q_proj(xm).permute(0, 2, 1)   # [B, L, C]
+        K = self.k_proj(xl)                    # [B, C, L]
+        V = self.v_proj(xl).permute(0, 2, 1)   # [B, L, C]
+
+        attn = torch.softmax(
+            torch.bmm(Q, K) / self.scale,
+            dim=-1
+        )
+        x_attn = torch.bmm(attn, V).permute(0, 2, 1)
+        x_attn = self.dropout(x_attn)
+
+        x_fused = torch.cat([xm, x_attn], dim=1)
+        x_fused = self.fuse_conv(x_fused)
+        x_fused = self.refine_conv(x_fused)
+
+        x_flat = x_fused.view(B, -1)
+        out = self.fc(x_flat)
+        return out
